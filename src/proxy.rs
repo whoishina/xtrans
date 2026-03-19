@@ -11,22 +11,34 @@ pub fn run(ssh_args: &[String]) {
         std::process::exit(1);
     });
 
-    let control_path = std::env::temp_dir()
-        .join(format!("xtrans-ctrl-{}", std::process::id()))
-        .to_string_lossy()
-        .into_owned();
+    // ControlMaster multiplexing for fast image uploads — Unix only.
+    // Windows/MSYS2 lacks Unix domain socket fd-passing required by OpenSSH
+    // ControlMaster, causing "mm_receive_fd" errors.
+    let control_path = if cfg!(unix) {
+        Some(
+            std::env::temp_dir()
+                .join(format!("xtrans-ctrl-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        None
+    };
 
     let mut term = Terminal::new().unwrap_or_else(|e| {
         eprintln!("Terminal setup failed: {e}");
         std::process::exit(1);
     });
 
-    let mut child = Command::new("ssh")
-        .arg("-tt")
-        .arg("-o")
-        .arg("ControlMaster=auto")
-        .arg("-o")
-        .arg(format!("ControlPath={control_path}"))
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-tt");
+    if let Some(ref cp) = control_path {
+        cmd.arg("-o")
+            .arg("ControlMaster=auto")
+            .arg("-o")
+            .arg(format!("ControlPath={cp}"));
+    }
+    let mut child = cmd
         .args(ssh_args)
         .stdin(term.ssh_stdin())
         .stdout(Stdio::inherit())
@@ -44,7 +56,7 @@ pub fn run(ssh_args: &[String]) {
     let dest = remote_dest.clone();
 
     std::thread::spawn(move || {
-        input_loop(writer, &ctrl, &dest);
+        input_loop(writer, ctrl.as_deref(), &dest);
     });
 
     let status = child.wait().unwrap_or_else(|e| {
@@ -54,7 +66,9 @@ pub fn run(ssh_args: &[String]) {
     });
 
     term.cleanup();
-    let _ = std::fs::remove_file(&control_path);
+    if let Some(ref cp) = control_path {
+        let _ = std::fs::remove_file(cp);
+    }
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -62,7 +76,7 @@ pub fn run(ssh_args: &[String]) {
 // Input proxy
 // ---------------------------------------------------------------------------
 
-fn input_loop(mut ssh_stdin: Box<dyn Write + Send>, control_path: &str, remote_dest: &str) {
+fn input_loop(mut ssh_stdin: Box<dyn Write + Send>, control_path: Option<&str>, remote_dest: &str) {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut buf = [0u8; 4096];
@@ -83,7 +97,7 @@ fn input_loop(mut ssh_stdin: Box<dyn Write + Send>, control_path: &str, remote_d
 fn forward_input(
     input: &[u8],
     ssh_stdin: &mut dyn Write,
-    control_path: &str,
+    control_path: Option<&str>,
     remote_dest: &str,
 ) -> io::Result<()> {
     forward_input_with(input, ssh_stdin, |out| {
@@ -119,7 +133,11 @@ fn forward_input_with(
 // Clipboard paste handler
 // ---------------------------------------------------------------------------
 
-fn handle_paste(ssh_stdin: &mut (impl Write + ?Sized), control_path: &str, remote_dest: &str) {
+fn handle_paste(
+    ssh_stdin: &mut (impl Write + ?Sized),
+    control_path: Option<&str>,
+    remote_dest: &str,
+) {
     match clipboard::read() {
         clipboard::Content::Image(png_data) => {
             let ts = SystemTime::now()
@@ -150,26 +168,32 @@ fn handle_paste(ssh_stdin: &mut (impl Write + ?Sized), control_path: &str, remot
 // File transfer via SSH ControlMaster multiplexing
 // ---------------------------------------------------------------------------
 
-/// Upload bytes to remote by piping through a multiplexed SSH channel.
-/// Falls back to a new SSH connection if ControlMaster is unavailable.
+/// Upload bytes to remote by piping through an SSH channel.
+/// Uses ControlMaster multiplexing on Unix (fast, no re-auth).
+/// Falls back to a new SSH connection on Windows or when ControlMaster
+/// is unavailable (requires key-based auth or ssh-agent).
 fn upload_to_remote(
-    control_path: &str,
+    control_path: Option<&str>,
     remote_dest: &str,
     remote_path: &str,
     data: &[u8],
 ) -> bool {
-    let mut child = match Command::new("ssh")
-        .arg("-o")
-        .arg(format!("ControlPath={control_path}"))
-        .arg("-o")
-        .arg("ControlMaster=no")
+    let mut cmd = Command::new("ssh");
+    if let Some(cp) = control_path {
+        cmd.arg("-o")
+            .arg(format!("ControlPath={cp}"))
+            .arg("-o")
+            .arg("ControlMaster=no");
+    }
+    cmd.arg("-o")
+        .arg("BatchMode=yes")
         .arg(remote_dest)
         .arg(format!("cat > '{remote_path}'"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => return false,
     };
