@@ -108,7 +108,7 @@ impl UnixTerminal {
                 // New session — detach from parent's controlling terminal
                 libc::setsid();
                 // Make stdin (PTY slave, fd 0) the controlling terminal
-                libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
                 Ok(())
             });
         }
