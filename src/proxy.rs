@@ -38,6 +38,7 @@ pub fn run(ssh_args: &[String]) {
             .arg("-o")
             .arg(format!("ControlPath={cp}"));
     }
+    term.configure_ssh_command(&mut cmd);
     let mut child = cmd
         .args(ssh_args)
         .stdin(term.ssh_stdin())

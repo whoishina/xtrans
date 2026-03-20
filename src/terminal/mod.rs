@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 
 #[cfg(unix)]
 mod unix;
@@ -38,6 +38,14 @@ impl Terminal {
     /// and set up terminal resize handling.
     pub fn finalize(&mut self, child: &mut Child) -> Box<dyn Write + Send> {
         self.inner.finalize(child)
+    }
+
+    /// Configure the SSH Command before spawning.
+    /// On Unix: sets up setsid + TIOCSCTTY so the PTY slave becomes SSH's
+    /// controlling terminal. This makes SSH's /dev/tty point to the PTY,
+    /// allowing host key prompts and password prompts to work correctly.
+    pub fn configure_ssh_command(&self, cmd: &mut Command) {
+        self.inner.configure_ssh_command(cmd);
     }
 
     /// Restore terminal settings. Must be called before process exit

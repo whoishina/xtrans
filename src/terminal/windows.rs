@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Console::{
@@ -77,6 +77,10 @@ impl WindowsTerminal {
     pub fn finalize(&mut self, child: &mut Child) -> Box<dyn Write + Send> {
         let stdin = child.stdin.take().expect("SSH stdin pipe");
         Box::new(stdin)
+    }
+
+    pub fn configure_ssh_command(&self, _cmd: &mut Command) {
+        // Nothing needed on Windows — SSH uses console handles directly.
     }
 
     pub fn cleanup(&mut self) {

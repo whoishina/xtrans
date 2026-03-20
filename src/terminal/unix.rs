@@ -1,6 +1,7 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::FromRawFd;
-use std::process::{Child, Stdio};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 // PTY master fd and SSH child PID — accessed by async-signal-safe SIGWINCH handler
@@ -60,11 +61,57 @@ impl UnixTerminal {
     pub fn finalize(&mut self, child: &mut Child) -> Box<dyn Write + Send> {
         SSH_CHILD_PID.store(child.id() as i32, Ordering::Relaxed);
 
-        // Transfer ownership of master fd to File (closes fd on drop)
+        // Dup master fd: one for writing (input_loop), one for reading (output pump).
+        // PTY master is bidirectional — read returns slave's output (SSH's /dev/tty
+        // writes), write sends to slave's input (SSH reads from stdin//dev/tty).
+        let master_read_fd = unsafe { libc::dup(self.master_fd) };
+
+        // Spawn output pump: reads SSH's /dev/tty output from PTY master and
+        // forwards to the real terminal. Without this, host key prompts and
+        // password prompts are invisible (stuck in PTY master buffer).
+        if master_read_fd >= 0 {
+            set_cloexec(master_read_fd);
+            std::thread::spawn(move || {
+                let mut master_read =
+                    unsafe { std::fs::File::from_raw_fd(master_read_fd) };
+                let stdout = io::stdout();
+                let mut out = stdout.lock();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match Read::read(&mut master_read, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let _ = out.write_all(&buf[..n]);
+                            let _ = out.flush();
+                        }
+                    }
+                }
+            });
+        }
+
+        // Transfer ownership of master fd to File for input writing
         let file = unsafe { std::fs::File::from_raw_fd(self.master_fd) };
         self.master_fd = -1;
 
         Box::new(file)
+    }
+
+    pub fn configure_ssh_command(&self, cmd: &mut Command) {
+        // Make the PTY slave the controlling terminal for SSH.
+        // Without this, SSH opens /dev/tty (the real terminal) for interactive
+        // prompts (host key verification, password), but our input_loop is
+        // reading from the same real terminal — SSH never receives the input.
+        // After setsid + TIOCSCTTY, SSH's /dev/tty points to the PTY slave,
+        // so input from our PTY master reaches SSH's prompt reads.
+        unsafe {
+            cmd.pre_exec(|| {
+                // New session — detach from parent's controlling terminal
+                libc::setsid();
+                // Make stdin (PTY slave, fd 0) the controlling terminal
+                libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+                Ok(())
+            });
+        }
     }
 
     pub fn cleanup(&mut self) {
@@ -177,6 +224,15 @@ fn enter_raw_mode() -> libc::termios {
 
         let mut raw = original;
         libc::cfmakeraw(&mut raw);
+
+        // Re-enable output processing so \n → \r\n translation works.
+        // cfmakeraw clears OPOST, but SSH writes local messages (host key
+        // prompts, errors) directly to stderr with bare \n. Without OPOST
+        // the cursor moves down without returning to column 0.
+        // Remote output already contains \r\n (from remote PTY's OPOST),
+        // so the extra \r from ONLCR is harmless (\r\r\n = \r\n visually).
+        raw.c_oflag |= libc::OPOST | libc::ONLCR;
+
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw);
 
         original
