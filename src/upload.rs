@@ -30,14 +30,17 @@ mkdir -p "$dir" || exit 1
 base={name}
 stem=$base
 ext=
+# Split on the last dot, ignoring a leading dot (".bashrc") and a trailing one ("x.").
 case "$base" in
-  .*|*.*.*|*.) : ;;
-  *.*) stem=${{base%.*}}; ext=.${{base##*.}} ;;
+  *.) : ;;
+  .*.*|[!.]*.*) stem=${{base%.*}}; ext=.${{base##*.}} ;;
 esac
 i=0
 while [ "$i" -le 1000 ]; do
   if [ "$i" -eq 0 ]; then target="$dir/$base"; else target="$dir/$stem-$i$ext"; fi
-  if (cat > "$target") 2>/dev/null; then
+  # Skip taken names without reading stdin; noclobber guards the race window.
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    cat > "$target" || exit 1
     printf '%s\n' "$target"
     exit 0
   fi
@@ -158,6 +161,41 @@ mod tests {
         assert!(run(".bashrc", b"x").ends_with("/.bashrc-1"));
         assert!(run("name", b"x").ends_with("/name"));
         assert!(run("name", b"x").ends_with("/name-1"));
+        assert!(run("a.tar.gz", b"x").ends_with("/a.tar.gz"));
+        assert!(run("a.tar.gz", b"x").ends_with("/a.tar-1.gz"));
+        assert!(run(".env.local", b"x").ends_with("/.env.local"));
+        assert!(run(".env.local", b"x").ends_with("/.env-1.local"));
+        assert!(run("trail.", b"x").ends_with("/trail."));
+        assert!(run("trail.", b"x").ends_with("/trail.-1"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_upload_script_fails_without_retry_when_write_fails() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("xtrans-ro-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        // A directory occupying the target name makes the write fail
+        // for a reason other than "file exists" handled by the suffix loop.
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        fs::set_permissions(&dir, perms).unwrap();
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(upload_script(dir.to_str().unwrap(), "a.txt"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        fs::set_permissions(&dir, perms).unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         let _ = fs::remove_dir_all(dir);
     }
 }

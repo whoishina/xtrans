@@ -232,9 +232,9 @@ fn unix_timestamp() -> u64 {
 }
 
 fn paste_text(ssh_stdin: &mut (impl Write + ?Sized), text: &str) {
-    let _ = ssh_stdin.write_all(b"\\x1b[200~");
+    let _ = ssh_stdin.write_all(b"\x1b[200~");
     let _ = ssh_stdin.write_all(text.as_bytes());
-    let _ = ssh_stdin.write_all(b"\\x1b[201~");
+    let _ = ssh_stdin.write_all(b"\x1b[201~");
     let _ = ssh_stdin.flush();
 }
 
@@ -259,6 +259,8 @@ fn write_remote_paths(ssh_stdin: &mut (impl Write + ?Sized), paths: &[String]) {
     }
 }
 
+const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+
 fn download_url(url: &str) -> Option<(std::path::PathBuf, String)> {
     let response = ureq::get(url)
         .config()
@@ -274,41 +276,55 @@ fn download_url(url: &str) -> Option<(std::path::PathBuf, String)> {
     let path = std::env::temp_dir().join(format!("xtrans-dl-{}-{name}", unix_timestamp()));
     let reader = response.into_body().into_reader();
     let mut file = File::create(&path).ok()?;
-    let mut limited = reader.take(200 * 1024 * 1024 + 1);
-    io::copy(&mut limited, &mut file).ok()?;
-    if file.metadata().ok()?.len() > 200 * 1024 * 1024 {
-        let _ = std::fs::remove_file(&path);
-        eprintln!("\r\nDownloaded URL exceeds 200 MB");
-        return None;
+    let mut limited = reader.take(MAX_DOWNLOAD_BYTES + 1);
+    match io::copy(&mut limited, &mut file) {
+        Ok(n) if n <= MAX_DOWNLOAD_BYTES => Some((path, name)),
+        Ok(_) => {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("\r\nxtrans: download exceeds 200 MB, pasting URL as text\r");
+            None
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("\r\nxtrans: download failed ({e}), pasting URL as text\r");
+            None
+        }
     }
-    Some((path, name))
 }
 
 fn filename_from_url(url: &str, disposition: Option<&str>) -> String {
-    let candidate = disposition.and_then(|header| {
-        header.split(';').map(str::trim).find_map(|part| {
-            let lower = part.to_ascii_lowercase();
-            if lower.starts_with("filename*=") {
-                let value = part.split_once('=')?.1.trim();
-                let value = value
-                    .strip_prefix("UTF-8''")
-                    .or_else(|| value.strip_prefix("utf-8''"))?;
-                clipboard::percent_decode(value)
-            } else if lower.starts_with("filename=") {
-                Some(part.split_once('=')?.1.trim_matches(['"', '\'']).to_owned())
-            } else {
-                None
-            }
+    let candidate = disposition
+        .and_then(|header| disposition_param(header, "filename*"))
+        .and_then(|value| {
+            let (charset, rest) = value.split_once("''")?;
+            charset
+                .eq_ignore_ascii_case("utf-8")
+                .then(|| clipboard::percent_decode(rest))?
         })
-    });
-    let candidate = candidate.or_else(|| {
-        url.split(['?', '#'])
-            .next()?
-            .rsplit('/')
-            .find(|part| !part.is_empty())
-            .and_then(clipboard::percent_decode)
-    });
-    upload::sanitize_filename(candidate.as_deref().unwrap_or("download")).to_owned()
+        .or_else(|| {
+            disposition
+                .and_then(|header| disposition_param(header, "filename"))
+                .map(|value| value.trim_matches(['"', '\'']).to_owned())
+        })
+        .or_else(|| {
+            // Only the path part names the file; the host never does.
+            let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+            let path = without_scheme.split(['?', '#']).next()?.split_once('/')?.1;
+            path.rsplit('/')
+                .find(|part| !part.is_empty())
+                .and_then(clipboard::percent_decode)
+        });
+    upload::sanitize_filename(candidate.as_deref().unwrap_or("download"))
+}
+
+/// Find a `name=value` parameter in a Content-Disposition header (name is case-insensitive).
+fn disposition_param<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    header.split(';').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then_some(value.trim())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -442,5 +458,93 @@ mod tests {
         forward_input_with(b"normal text", &mut out, |_| count += 1).unwrap();
         assert_eq!(count, 0);
         assert_eq!(out, b"normal text");
+    }
+
+    // -- paste_text ------------------------------------------------------
+
+    #[test]
+    fn paste_text_wraps_in_bracketed_paste_escapes() {
+        let mut out = Vec::new();
+        paste_text(&mut out, "hi");
+        assert_eq!(out, b"\x1b[200~hi\x1b[201~");
+    }
+
+    #[test]
+    fn paste_text_keeps_multiline_content() {
+        let mut out = Vec::new();
+        paste_text(&mut out, "a\nb");
+        assert_eq!(out, b"\x1b[200~a\nb\x1b[201~");
+    }
+
+    // -- write_remote_paths ----------------------------------------------
+
+    #[test]
+    fn remote_paths_plain_are_space_joined() {
+        let mut out = Vec::new();
+        write_remote_paths(&mut out, &["/srv/a.txt".into(), "/srv/b-1.tar.gz".into()]);
+        assert_eq!(out, b"/srv/a.txt /srv/b-1.tar.gz");
+    }
+
+    #[test]
+    fn remote_paths_with_special_chars_are_quoted() {
+        let mut out = Vec::new();
+        write_remote_paths(&mut out, &["/srv/my file's.txt".into()]);
+        assert_eq!(out, b"'/srv/my file'\\''s.txt'");
+    }
+
+    #[test]
+    fn remote_paths_empty_writes_nothing() {
+        let mut out = Vec::new();
+        write_remote_paths(&mut out, &[]);
+        assert!(out.is_empty());
+    }
+
+    // -- filename_from_url -----------------------------------------------
+
+    #[test]
+    fn filename_from_url_last_segment_decoded() {
+        assert_eq!(
+            filename_from_url("https://x.test/dir/my%20doc.pdf?x=1#frag", None),
+            "my doc.pdf"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_prefers_rfc5987_disposition() {
+        assert_eq!(
+            filename_from_url(
+                "https://x.test/download",
+                Some("attachment; filename=\"plain.txt\"; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf")
+            ),
+            "résumé.pdf"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_quoted_disposition() {
+        assert_eq!(
+            filename_from_url(
+                "https://x.test/d",
+                Some("attachment; filename=\"report.csv\"")
+            ),
+            "report.csv"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_falls_back_to_download() {
+        assert_eq!(filename_from_url("https://x.test/", None), "download");
+        assert_eq!(filename_from_url("https://x.test", None), "download");
+    }
+
+    #[test]
+    fn filename_from_url_strips_traversal_in_disposition() {
+        assert_eq!(
+            filename_from_url(
+                "https://x.test/d",
+                Some("attachment; filename=\"../../etc/passwd\"")
+            ),
+            "passwd"
+        );
     }
 }
