@@ -1,9 +1,12 @@
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::clipboard;
+use crate::remote;
 use crate::terminal::Terminal;
+use crate::upload;
 
 pub fn run(ssh_args: &[String]) {
     let remote_dest = parse_ssh_destination(ssh_args).unwrap_or_else(|| {
@@ -11,7 +14,16 @@ pub fn run(ssh_args: &[String]) {
         std::process::exit(1);
     });
 
-    // ControlMaster multiplexing for fast image uploads — Unix only.
+    let session_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+
+    // ControlMaster multiplexing for fast uploads — Unix only.
     // Windows/MSYS2 lacks Unix domain socket fd-passing required by OpenSSH
     // ControlMaster, causing "mm_receive_fd" errors.
     let control_path = if cfg!(unix) {
@@ -38,6 +50,10 @@ pub fn run(ssh_args: &[String]) {
             .arg("-o")
             .arg(format!("ControlPath={cp}"));
     }
+    if cfg!(unix) {
+        cmd.arg("-o")
+            .arg(format!("SetEnv=LC_XTRANS_ID={session_id}"));
+    }
     term.configure_ssh_command(&mut cmd);
     let mut child = cmd
         .args(ssh_args)
@@ -56,8 +72,9 @@ pub fn run(ssh_args: &[String]) {
     let ctrl = control_path.clone();
     let dest = remote_dest.clone();
 
+    let sid = session_id.clone();
     std::thread::spawn(move || {
-        input_loop(writer, ctrl.as_deref(), &dest);
+        input_loop(writer, ctrl.as_deref(), &dest, &sid);
     });
 
     let status = child.wait().unwrap_or_else(|e| {
@@ -77,7 +94,12 @@ pub fn run(ssh_args: &[String]) {
 // Input proxy
 // ---------------------------------------------------------------------------
 
-fn input_loop(mut ssh_stdin: Box<dyn Write + Send>, control_path: Option<&str>, remote_dest: &str) {
+fn input_loop(
+    mut ssh_stdin: Box<dyn Write + Send>,
+    control_path: Option<&str>,
+    remote_dest: &str,
+    session_id: &str,
+) {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut buf = [0u8; 4096];
@@ -88,7 +110,15 @@ fn input_loop(mut ssh_stdin: Box<dyn Write + Send>, control_path: Option<&str>, 
             Ok(n) => n,
         };
 
-        if forward_input(&buf[..n], &mut *ssh_stdin, control_path, remote_dest).is_err() {
+        if forward_input(
+            &buf[..n],
+            &mut *ssh_stdin,
+            control_path,
+            remote_dest,
+            session_id,
+        )
+        .is_err()
+        {
             break;
         }
     }
@@ -100,9 +130,10 @@ fn forward_input(
     ssh_stdin: &mut dyn Write,
     control_path: Option<&str>,
     remote_dest: &str,
+    session_id: &str,
 ) -> io::Result<()> {
     forward_input_with(input, ssh_stdin, |out| {
-        handle_paste(out, control_path, remote_dest);
+        handle_paste(out, control_path, remote_dest, session_id);
     })
 }
 
@@ -138,26 +169,54 @@ fn handle_paste(
     ssh_stdin: &mut (impl Write + ?Sized),
     control_path: Option<&str>,
     remote_dest: &str,
+    session_id: &str,
 ) {
     match clipboard::read() {
         clipboard::Content::Image(png_data) => {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Clock error")
-                .as_secs();
+            let ts = unix_timestamp();
             let remote_path = format!("/tmp/xtrans-{ts}.png");
-
-            if upload_to_remote(control_path, remote_dest, &remote_path, &png_data) {
-                let _ = ssh_stdin.write_all(remote_path.as_bytes());
-                let _ = ssh_stdin.flush();
+            if let Some(path) = upload::upload_to_remote(
+                control_path,
+                remote_dest,
+                &format!(
+                    "cat > {} && printf '%s\\n' {}",
+                    upload::shell_quote(&remote_path),
+                    upload::shell_quote(&remote_path)
+                ),
+                png_data.as_slice(),
+            ) {
+                write_remote_paths(ssh_stdin, &[path]);
             }
         }
-        clipboard::Content::Text(text) => {
-            let _ = ssh_stdin.write_all(b"\x1b[200~");
-            let _ = ssh_stdin.write_all(text.as_bytes());
-            let _ = ssh_stdin.write_all(b"\x1b[201~");
-            let _ = ssh_stdin.flush();
+        clipboard::Content::Files(files) => {
+            let dir = remote::detect_cwd(control_path, remote_dest, session_id)
+                .unwrap_or_else(|| format!("/tmp/xtrans-{}", unix_timestamp()));
+            let mut paths = Vec::new();
+            for file in files {
+                let name = file
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("xtrans-file");
+                match upload::upload_file(control_path, remote_dest, &dir, name, &file) {
+                    Some(path) => paths.push(path),
+                    None => eprintln!("\r\nFailed to upload {}", file.display()),
+                }
+            }
+            write_remote_paths(ssh_stdin, &paths);
         }
+        clipboard::Content::Url(url) => match download_url(&url) {
+            Some((path, name)) => {
+                let dir = remote::detect_cwd(control_path, remote_dest, session_id)
+                    .unwrap_or_else(|| format!("/tmp/xtrans-{}", unix_timestamp()));
+                let result = upload::upload_file(control_path, remote_dest, &dir, &name, &path);
+                let _ = std::fs::remove_file(path);
+                if let Some(remote_path) = result {
+                    write_remote_paths(ssh_stdin, &[remote_path]);
+                }
+            }
+            None => paste_text(ssh_stdin, &url),
+        },
+        clipboard::Content::Text(text) => paste_text(ssh_stdin, &text),
         clipboard::Content::Empty => {
             let _ = ssh_stdin.write_all(&[0x16]);
             let _ = ssh_stdin.flush();
@@ -165,47 +224,107 @@ fn handle_paste(
     }
 }
 
-// ---------------------------------------------------------------------------
-// File transfer via SSH ControlMaster multiplexing
-// ---------------------------------------------------------------------------
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
 
-/// Upload bytes to remote by piping through an SSH channel.
-/// Uses ControlMaster multiplexing on Unix (fast, no re-auth).
-/// Falls back to a new SSH connection on Windows or when ControlMaster
-/// is unavailable (requires key-based auth or ssh-agent).
-fn upload_to_remote(
-    control_path: Option<&str>,
-    remote_dest: &str,
-    remote_path: &str,
-    data: &[u8],
-) -> bool {
-    let mut cmd = Command::new("ssh");
-    if let Some(cp) = control_path {
-        cmd.arg("-o")
-            .arg(format!("ControlPath={cp}"))
-            .arg("-o")
-            .arg("ControlMaster=no");
+fn paste_text(ssh_stdin: &mut (impl Write + ?Sized), text: &str) {
+    let _ = ssh_stdin.write_all(b"\x1b[200~");
+    let _ = ssh_stdin.write_all(text.as_bytes());
+    let _ = ssh_stdin.write_all(b"\x1b[201~");
+    let _ = ssh_stdin.flush();
+}
+
+fn write_remote_paths(ssh_stdin: &mut (impl Write + ?Sized), paths: &[String]) {
+    let rendered = paths
+        .iter()
+        .map(|path| {
+            if path.bytes().all(|byte| {
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/+-@%:,="
+                    .contains(&byte)
+            }) {
+                path.clone()
+            } else {
+                upload::shell_quote(path)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !rendered.is_empty() {
+        let _ = ssh_stdin.write_all(rendered.as_bytes());
+        let _ = ssh_stdin.flush();
     }
-    cmd.arg("-o")
-        .arg("BatchMode=yes")
-        .arg(remote_dest)
-        .arg(format!("cat > '{remote_path}'"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+}
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
-    let ok = if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(data).is_ok()
-    } else {
-        false
-    };
+fn download_url(url: &str) -> Option<(std::path::PathBuf, String)> {
+    let response = ureq::get(url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build()
+        .call()
+        .ok()?;
+    let disposition = response
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok());
+    let name = filename_from_url(url, disposition);
+    let path = std::env::temp_dir().join(format!("xtrans-dl-{}-{name}", unix_timestamp()));
+    let reader = response.into_body().into_reader();
+    let mut file = File::create(&path).ok()?;
+    let mut limited = reader.take(MAX_DOWNLOAD_BYTES + 1);
+    match io::copy(&mut limited, &mut file) {
+        Ok(n) if n <= MAX_DOWNLOAD_BYTES => Some((path, name)),
+        Ok(_) => {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("\r\nxtrans: download exceeds 200 MB, pasting URL as text\r");
+            None
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            eprintln!("\r\nxtrans: download failed ({e}), pasting URL as text\r");
+            None
+        }
+    }
+}
 
-    ok && child.wait().map(|s| s.success()).unwrap_or(false)
+fn filename_from_url(url: &str, disposition: Option<&str>) -> String {
+    let candidate = disposition
+        .and_then(|header| disposition_param(header, "filename*"))
+        .and_then(|value| {
+            let (charset, rest) = value.split_once("''")?;
+            charset
+                .eq_ignore_ascii_case("utf-8")
+                .then(|| clipboard::percent_decode(rest))?
+        })
+        .or_else(|| {
+            disposition
+                .and_then(|header| disposition_param(header, "filename"))
+                .map(|value| value.trim_matches(['"', '\'']).to_owned())
+        })
+        .or_else(|| {
+            // Only the path part names the file; the host never does.
+            let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+            let path = without_scheme.split(['?', '#']).next()?.split_once('/')?.1;
+            path.rsplit('/')
+                .find(|part| !part.is_empty())
+                .and_then(clipboard::percent_decode)
+        });
+    upload::sanitize_filename(candidate.as_deref().unwrap_or("download"))
+}
+
+/// Find a `name=value` parameter in a Content-Disposition header (name is case-insensitive).
+fn disposition_param<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    header.split(';').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then_some(value.trim())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -214,8 +333,8 @@ fn upload_to_remote(
 
 fn parse_ssh_destination(args: &[String]) -> Option<String> {
     const OPTS_WITH_ARG: &[char] = &[
-        'b', 'c', 'D', 'E', 'e', 'F', 'I', 'i', 'J', 'L', 'l', 'm', 'O', 'o', 'p', 'Q', 'R',
-        'S', 'W', 'w',
+        'b', 'c', 'D', 'E', 'e', 'F', 'I', 'i', 'J', 'L', 'l', 'm', 'O', 'o', 'p', 'Q', 'R', 'S',
+        'W', 'w',
     ];
 
     let mut i = 0;
@@ -339,5 +458,93 @@ mod tests {
         forward_input_with(b"normal text", &mut out, |_| count += 1).unwrap();
         assert_eq!(count, 0);
         assert_eq!(out, b"normal text");
+    }
+
+    // -- paste_text ------------------------------------------------------
+
+    #[test]
+    fn paste_text_wraps_in_bracketed_paste_escapes() {
+        let mut out = Vec::new();
+        paste_text(&mut out, "hi");
+        assert_eq!(out, b"\x1b[200~hi\x1b[201~");
+    }
+
+    #[test]
+    fn paste_text_keeps_multiline_content() {
+        let mut out = Vec::new();
+        paste_text(&mut out, "a\nb");
+        assert_eq!(out, b"\x1b[200~a\nb\x1b[201~");
+    }
+
+    // -- write_remote_paths ----------------------------------------------
+
+    #[test]
+    fn remote_paths_plain_are_space_joined() {
+        let mut out = Vec::new();
+        write_remote_paths(&mut out, &["/srv/a.txt".into(), "/srv/b-1.tar.gz".into()]);
+        assert_eq!(out, b"/srv/a.txt /srv/b-1.tar.gz");
+    }
+
+    #[test]
+    fn remote_paths_with_special_chars_are_quoted() {
+        let mut out = Vec::new();
+        write_remote_paths(&mut out, &["/srv/my file's.txt".into()]);
+        assert_eq!(out, b"'/srv/my file'\\''s.txt'");
+    }
+
+    #[test]
+    fn remote_paths_empty_writes_nothing() {
+        let mut out = Vec::new();
+        write_remote_paths(&mut out, &[]);
+        assert!(out.is_empty());
+    }
+
+    // -- filename_from_url -----------------------------------------------
+
+    #[test]
+    fn filename_from_url_last_segment_decoded() {
+        assert_eq!(
+            filename_from_url("https://x.test/dir/my%20doc.pdf?x=1#frag", None),
+            "my doc.pdf"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_prefers_rfc5987_disposition() {
+        assert_eq!(
+            filename_from_url(
+                "https://x.test/download",
+                Some("attachment; filename=\"plain.txt\"; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf")
+            ),
+            "résumé.pdf"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_quoted_disposition() {
+        assert_eq!(
+            filename_from_url(
+                "https://x.test/d",
+                Some("attachment; filename=\"report.csv\"")
+            ),
+            "report.csv"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_falls_back_to_download() {
+        assert_eq!(filename_from_url("https://x.test/", None), "download");
+        assert_eq!(filename_from_url("https://x.test", None), "download");
+    }
+
+    #[test]
+    fn filename_from_url_strips_traversal_in_disposition() {
+        assert_eq!(
+            filename_from_url(
+                "https://x.test/d",
+                Some("attachment; filename=\"../../etc/passwd\"")
+            ),
+            "passwd"
+        );
     }
 }

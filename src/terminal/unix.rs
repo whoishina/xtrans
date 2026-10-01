@@ -72,8 +72,7 @@ impl UnixTerminal {
         if master_read_fd >= 0 {
             set_cloexec(master_read_fd);
             std::thread::spawn(move || {
-                let mut master_read =
-                    unsafe { std::fs::File::from_raw_fd(master_read_fd) };
+                let mut master_read = unsafe { std::fs::File::from_raw_fd(master_read_fd) };
                 let stdout = io::stdout();
                 let mut out = stdout.lock();
                 let mut buf = [0u8; 4096];
@@ -206,7 +205,7 @@ extern "C" fn sigwinch_handler(_sig: libc::c_int) {
 fn install_sigwinch_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigwinch_handler as usize;
+        sa.sa_sigaction = sigwinch_handler as *const () as usize;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut());

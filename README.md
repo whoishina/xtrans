@@ -15,6 +15,9 @@ xtrans ssh user@host
 This wraps `ssh` transparently. Everything works exactly like a normal SSH session, except:
 
 - **Ctrl+V with an image** in your clipboard: the image is uploaded to `/tmp/` on the remote via the existing SSH connection, and the file path is typed into the terminal. Claude Code automatically recognizes file paths as attachments.
+- **Ctrl+V with files** copied from Finder/File Explorer: regular files are uploaded into the detected remote working directory. Directories are skipped.
+- **Ctrl+V with a path or `file://` URI** in text: an existing regular file is uploaded. Multiple file paths on separate lines are supported.
+- **Ctrl+V with an `http://` or `https://` URL**: the URL is downloaded locally (up to 200 MB), then uploaded as a file.
 - **Ctrl+V with text**: standard bracketed paste (same as normal terminal paste).
 - **Ctrl+V with empty clipboard**: the raw Ctrl+V byte is forwarded as usual.
 
@@ -104,6 +107,17 @@ Local machine                          Remote server
 | Resize handling | SIGWINCH signal handler | SSH handles via Console API |
 | Native library | `libc` | `windows-sys` |
 
+### How file and image upload works
+
+1. Ctrl+V is detected in the input byte stream (byte `0x16`)
+2. Clipboard content is classified as files, an image, a URL, text, or empty
+3. File paths and downloaded URLs are uploaded through an SSH channel
+4. On Unix, xtrans sets `LC_XTRANS_ID` with `SetEnv`; Linux `/proc` inspection finds the foreground process group's working directory. The SSH server must accept `LC_*` environment variables (`AcceptEnv LC_*`, which is the Debian/Ubuntu default).
+5. If the working directory cannot be detected, files go to `/tmp/xtrans-<timestamp>/`
+6. Existing names are never overwritten: duplicates receive `-1`, `-2`, and so on before the extension. Directories are unsupported.
+
+Images continue to use `/tmp/xtrans-<timestamp>.png`.
+
 ### How image upload works
 
 1. Ctrl+V detected in the input byte stream (byte `0x16`)
@@ -120,6 +134,7 @@ Local machine                          Remote server
 | [clap](https://crates.io/crates/clap) | CLI argument parsing |
 | [arboard](https://crates.io/crates/arboard) | Cross-platform clipboard access (text + image) |
 | [image](https://crates.io/crates/image) | PNG encoding |
+| [ureq](https://crates.io/crates/ureq) | HTTPS URL downloads |
 | [libc](https://crates.io/crates/libc) | POSIX syscalls — PTY, termios, signals (Unix only) |
 | [windows-sys](https://crates.io/crates/windows-sys) | Win32 Console API (Windows only) |
 

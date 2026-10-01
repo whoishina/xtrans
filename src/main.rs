@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 
 mod clipboard;
 mod proxy;
+mod remote;
 mod terminal;
+mod upload;
 
 #[derive(Parser)]
 #[command(
